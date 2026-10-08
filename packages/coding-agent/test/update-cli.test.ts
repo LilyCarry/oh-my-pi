@@ -2106,18 +2106,15 @@ describe("update-cli Windows npm trampoline", () => {
 		);
 	});
 
-	it("spawns the detached batch script with unref and calls exitImpl", async () => {
+	it("spawns the detached batch script with Bun.spawn and returns script and log paths", async () => {
 		const dir = await makeTempDir();
 		const logFile = path.join(dir, "update.log");
-		let spawnedCommand: string | undefined;
 		let spawnedArgs: string[] | undefined;
 		let spawnedOptions: unknown;
 		let unrefCalled = false;
-		let exitCode: number | undefined;
 
-		const spawnImpl = (cmd: string, args: string[], options: unknown) => {
-			spawnedCommand = cmd;
-			spawnedArgs = args;
+		const spawnImpl = (cmd: string[], options: unknown) => {
+			spawnedArgs = cmd;
 			spawnedOptions = options;
 			return {
 				unref: () => {
@@ -2126,40 +2123,33 @@ describe("update-cli Windows npm trampoline", () => {
 			};
 		};
 
-		const exitImpl = (code: number) => {
-			exitCode = code;
-		};
-
-		const scriptPath = await spawnWindowsNpmTrampoline(["install", "-g", "test-pkg"], release, {
+		const result = await spawnWindowsNpmTrampoline(["install", "-g", "test-pkg"], release, {
 			parentPid: 99999,
 			tempDir: dir,
 			logFile,
 			spawnImpl,
-			exitImpl,
 		});
 
-		expect(spawnedCommand).toBe("cmd.exe");
-		expect(spawnedArgs).toEqual(["/c", scriptPath]);
+		expect(spawnedArgs).toEqual(["cmd.exe", "/c", result.scriptPath]);
 		expect(spawnedOptions).toEqual({
 			detached: true,
-			stdio: "ignore",
+			stdio: ["ignore", "ignore", "ignore"],
 			windowsHide: true,
 		});
 		expect(unrefCalled).toBe(true);
-		expect(exitCode).toBe(0);
+		expect(result.logPath).toBe(logFile);
 
 		// Verify the file was written to disk
-		const writtenScript = await fs.readFile(scriptPath, "utf-8");
+		const writtenScript = await fs.readFile(result.scriptPath, "utf-8");
 		expect(writtenScript).toContain("Wait-Process -Id 99999");
 		expect(writtenScript).toContain("call npm install -g test-pkg");
 	});
 
-	it("delegates to trampoline in updateViaNpm on Windows and defers verification", async () => {
+	it("delegates to trampoline in updateViaNpm and returns deferred result", async () => {
 		const dir = await makeTempDir();
 		let spawned = false;
-		let exited = false;
 
-		const verification = await updateViaNpm(release, {
+		const outcome = await updateViaNpm(release, {
 			trampoline: true,
 			trampolineOptions: {
 				parentPid: 88888,
@@ -2168,14 +2158,36 @@ describe("update-cli Windows npm trampoline", () => {
 					spawned = true;
 					return { unref: () => {} };
 				},
-				exitImpl: () => {
-					exited = true;
-				},
 			},
 		});
 
 		expect(spawned).toBe(true);
-		expect(exited).toBe(true);
-		expect(verification).toBeUndefined();
+		expect(outcome).toEqual({
+			deferred: true,
+			logPath: expect.stringContaining("omp-update-88888-"),
+		});
+	});
+
+	it("returns deferred result from updateViaManager without running verify or repair", async () => {
+		const calls: string[] = [];
+		const steps: ManagerUpdateSteps = {
+			manager: "npm",
+			install: async () => {
+				calls.push("install");
+				return { deferred: true, logPath: "C:\\Temp\\update.log" };
+			},
+			verify: async () => {
+				calls.push("verify");
+				return { ok: true, actual: release.version };
+			},
+			repair: async () => {
+				calls.push("repair");
+			},
+		};
+
+		const outcome = await updateViaManager(release, "C:\\Temp\\omp.cmd", steps);
+
+		expect(calls).toEqual(["install"]);
+		expect(outcome).toEqual({ deferred: true, logPath: "C:\\Temp\\update.log" });
 	});
 });

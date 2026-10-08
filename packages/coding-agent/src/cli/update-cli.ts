@@ -4,7 +4,6 @@
  * Handles `omp update` to check for and install updates.
  * Uses the installer that owns the active omp executable when it can be detected.
  */
-import { spawn, type StdioOptions } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1807,17 +1806,24 @@ async function updateViaBun(release: ReleaseInfo): Promise<InstalledVersionVerif
 	return verification;
 }
 
+/** Result of a deferred background update hand-off. */
+export interface DeferredUpdateResult {
+	deferred: true;
+	logPath: string;
+}
+
+/** Result of a manager install step: verified PATH launcher, deferred background update, or rename migration. */
+export type ManagerInstallResult = InstalledVersionVerification | DeferredUpdateResult | undefined;
+
 /** Test options for Windows npm trampoline execution. */
 export interface WindowsNpmTrampolineOptions {
 	parentPid?: number;
 	tempDir?: string;
 	logFile?: string;
 	spawnImpl?: (
-		command: string,
-		args: string[],
-		options: { detached: boolean; stdio: StdioOptions; windowsHide: boolean },
+		cmd: string[],
+		options: { detached?: boolean; stdio?: ["ignore", "ignore", "ignore"]; windowsHide?: boolean },
 	) => { unref?: () => void };
-	exitImpl?: (code: number) => void;
 }
 
 /**
@@ -1852,12 +1858,12 @@ export function buildWindowsNpmTrampolineScript(parentPid: number, npmArgs: stri
 	].join("\r\n");
 }
 
-/** Spawn the detached Windows trampoline and exit so npm can replace locked files. */
+/** Spawn the detached Windows trampoline script so npm can replace locked files. */
 export async function spawnWindowsNpmTrampoline(
 	args: string[],
 	release: ReleaseInfo,
 	options: WindowsNpmTrampolineOptions = {},
-): Promise<string> {
+): Promise<{ scriptPath: string; logPath: string }> {
 	const parentPid = options.parentPid ?? process.pid;
 	const tempDir = options.tempDir ?? os.tmpdir();
 	const timestamp = Date.now();
@@ -1865,12 +1871,12 @@ export async function spawnWindowsNpmTrampoline(
 	const logPath = options.logFile ?? path.join(tempDir, `omp-update-${parentPid}-${timestamp}.log`);
 
 	const scriptContent = buildWindowsNpmTrampolineScript(parentPid, args, logPath);
-	await fs.promises.writeFile(scriptPath, scriptContent, "utf8");
+	await Bun.write(scriptPath, scriptContent);
 
-	const spawnFn = options.spawnImpl ?? spawn;
-	const child = spawnFn("cmd.exe", ["/c", scriptPath], {
+	const spawnFn = options.spawnImpl ?? Bun.spawn;
+	const child = spawnFn(["cmd.exe", "/c", scriptPath], {
 		detached: true,
-		stdio: "ignore",
+		stdio: ["ignore", "ignore", "ignore"],
 		windowsHide: true,
 	});
 	child.unref?.();
@@ -1878,19 +1884,17 @@ export async function spawnWindowsNpmTrampoline(
 	console.log(chalk.cyan(`Spawning detached updater to update to ${release.version}...`));
 	console.log(chalk.dim(`The current process will exit so npm can replace active files. Log: ${logPath}`));
 
-	const exitFn = options.exitImpl ?? process.exit;
-	exitFn(0);
-
-	return scriptPath;
+	return { scriptPath, logPath };
 }
 
 export async function updateViaNpm(
 	release: ReleaseInfo,
 	options: {
+		platform?: NodeJS.Platform;
 		trampoline?: boolean;
 		trampolineOptions?: WindowsNpmTrampolineOptions;
 	} = {},
-): Promise<InstalledVersionVerification | undefined> {
+): Promise<ManagerInstallResult> {
 	console.log(chalk.dim("Updating via npm..."));
 	if (release.packages.pkg !== PACKAGE) {
 		await migrateRenamedInstall(release, packageManagerMigrationSteps("npm", release));
@@ -1902,10 +1906,11 @@ export async function updateViaNpm(
 
 	// On Windows, in-process npm updates hit EBUSY while this process holds
 	// cli.js and native addons open. Hand off to a detached helper instead.
-	const enableTrampoline = options.trampoline ?? process.env.OMP_NO_UPDATE_TRAMPOLINE !== "1";
-	if (process.platform === "win32" && enableTrampoline) {
-		await spawnWindowsNpmTrampoline(args, release, options.trampolineOptions);
-		return undefined;
+	const platform = options.platform ?? process.platform;
+	const enableTrampoline = options.trampoline ?? platform === "win32";
+	if (enableTrampoline) {
+		const { logPath } = await spawnWindowsNpmTrampoline(args, release, options.trampolineOptions);
+		return { deferred: true, logPath };
 	}
 
 	const result = await $`npm ${args}`.nothrow();
@@ -1915,16 +1920,17 @@ export async function updateViaNpm(
 
 	return await verifyInstalledVersion(release.version);
 }
+
 /** Injectable steps for {@link updateViaManager}; mirrors {@link RenameMigrationSteps}. */
 export interface ManagerUpdateSteps {
 	/** Manager name used in progress and recovery messages. */
 	manager: string;
 	/**
 	 * Run the manager's global install. Resolves to the PATH-resolved launcher
-	 * check, or `undefined` when a rename migration already verified and
-	 * reported its own result.
+	 * check, a deferred background handoff, or `undefined` when a rename
+	 * migration already verified and reported its own result.
 	 */
-	install(): Promise<InstalledVersionVerification | undefined>;
+	install(): Promise<ManagerInstallResult>;
 	/** Re-check the PATH-resolved launcher after the install threw. */
 	verify(): Promise<InstalledVersionVerification>;
 	/** Take `launcherPath` over with the standalone release binary. */
@@ -1974,13 +1980,17 @@ export async function updateViaManager(
 	release: ReleaseInfo,
 	launcherPath: string | undefined,
 	steps: ManagerUpdateSteps,
-): Promise<void> {
+): Promise<DeferredUpdateResult | void> {
 	let installError: unknown;
 	let verification: InstalledVersionVerification | undefined;
 	try {
-		verification = await steps.install();
+		const installResult = await steps.install();
+		if (installResult && "deferred" in installResult) {
+			return installResult;
+		}
 		// A rename migration verifies and reports on its own.
-		if (!verification) return;
+		if (!installResult) return;
+		verification = installResult;
 	} catch (err) {
 		installError = err;
 	}
@@ -2396,11 +2406,20 @@ export async function runUpdateCommand(opts: {
 					),
 				);
 			} else {
-				await updateViaManager(
+				const outcome = await updateViaManager(
 					release,
 					target.path,
 					packageManagerUpdateSteps(target.method, release, allowPrerelease),
 				);
+				if (outcome?.deferred) {
+					if (opts.channel) persistChannel(channel);
+					console.log(
+						chalk.cyan(
+							`\nUpdate to ${release.version} handed off to background process; will complete once ${APP_NAME} exits.\nLog: ${outcome.logPath}`,
+						),
+					);
+					return;
+				}
 			}
 		} else {
 			if (forceBinary && target.replacesSymlink) {
