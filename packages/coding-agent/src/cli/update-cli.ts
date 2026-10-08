@@ -4,6 +4,7 @@
  * Handles `omp update` to check for and install updates.
  * Uses the installer that owns the active omp executable when it can be detected.
  */
+import { spawn, type StdioOptions } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1806,7 +1807,90 @@ async function updateViaBun(release: ReleaseInfo): Promise<InstalledVersionVerif
 	return verification;
 }
 
-async function updateViaNpm(release: ReleaseInfo): Promise<InstalledVersionVerification | undefined> {
+/** Test options for Windows npm trampoline execution. */
+export interface WindowsNpmTrampolineOptions {
+	parentPid?: number;
+	tempDir?: string;
+	logFile?: string;
+	spawnImpl?: (
+		command: string,
+		args: string[],
+		options: { detached: boolean; stdio: StdioOptions; windowsHide: boolean },
+	) => { unref?: () => void };
+	exitImpl?: (code: number) => void;
+}
+
+/**
+ * Batch helper that waits for this process to exit before running npm, so
+ * Windows releases locks on cli.js and loaded native addons.
+ */
+export function buildWindowsNpmTrampolineScript(parentPid: number, npmArgs: string[], logFilePath: string): string {
+	if (!Number.isInteger(parentPid) || parentPid <= 0) {
+		throw new Error(`Invalid parentPid: ${parentPid}`);
+	}
+	if (/[\r\n"]/.test(logFilePath)) {
+		throw new Error(`Invalid logFilePath: ${logFilePath}`);
+	}
+	const escapedArgs = npmArgs
+		.map(arg => {
+			if (/[\r\n]/.test(arg)) throw new Error(`Invalid newline in npm argument: ${arg}`);
+			const escaped = arg.replace(/%/g, "%%%%").replace(/"/g, '""');
+			return /[\s"^&|<>%]/.test(arg) ? `"${escaped}"` : escaped;
+		})
+		.join(" ");
+
+	return [
+		"@echo off",
+		"setlocal",
+		`powershell -NoProfile -Command "Wait-Process -Id ${parentPid} -Timeout 30 -ErrorAction SilentlyContinue" 2>nul`,
+		`call npm ${escapedArgs} > "${logFilePath}" 2>&1`,
+		"set EXIT_CODE=%ERRORLEVEL%",
+		`if %EXIT_CODE% equ 0 del /f /q "${logFilePath}" 2>nul`,
+		`start "" /b cmd /c "ping 127.0.0.1 -n 2 >nul & del /f /q "%~f0" >nul 2>&1"`,
+		"exit /b %EXIT_CODE%",
+		"",
+	].join("\r\n");
+}
+
+/** Spawn the detached Windows trampoline and exit so npm can replace locked files. */
+export async function spawnWindowsNpmTrampoline(
+	args: string[],
+	release: ReleaseInfo,
+	options: WindowsNpmTrampolineOptions = {},
+): Promise<string> {
+	const parentPid = options.parentPid ?? process.pid;
+	const tempDir = options.tempDir ?? os.tmpdir();
+	const timestamp = Date.now();
+	const scriptPath = path.join(tempDir, `omp-update-${parentPid}-${timestamp}.bat`);
+	const logPath = options.logFile ?? path.join(tempDir, `omp-update-${parentPid}-${timestamp}.log`);
+
+	const scriptContent = buildWindowsNpmTrampolineScript(parentPid, args, logPath);
+	await fs.promises.writeFile(scriptPath, scriptContent, "utf8");
+
+	const spawnFn = options.spawnImpl ?? spawn;
+	const child = spawnFn("cmd.exe", ["/c", scriptPath], {
+		detached: true,
+		stdio: "ignore",
+		windowsHide: true,
+	});
+	child.unref?.();
+
+	console.log(chalk.cyan(`Spawning detached updater to update to ${release.version}...`));
+	console.log(chalk.dim(`The current process will exit so npm can replace active files. Log: ${logPath}`));
+
+	const exitFn = options.exitImpl ?? process.exit;
+	exitFn(0);
+
+	return scriptPath;
+}
+
+export async function updateViaNpm(
+	release: ReleaseInfo,
+	options: {
+		trampoline?: boolean;
+		trampolineOptions?: WindowsNpmTrampolineOptions;
+	} = {},
+): Promise<InstalledVersionVerification | undefined> {
 	console.log(chalk.dim("Updating via npm..."));
 	if (release.packages.pkg !== PACKAGE) {
 		await migrateRenamedInstall(release, packageManagerMigrationSteps("npm", release));
@@ -1815,6 +1899,15 @@ async function updateViaNpm(release: ReleaseInfo): Promise<InstalledVersionVerif
 	const args = buildNpmInstallArgs(release.version, currentNativeTag(), release.packages, {
 		registry: release.registry,
 	});
+
+	// On Windows, in-process npm updates hit EBUSY while this process holds
+	// cli.js and native addons open. Hand off to a detached helper instead.
+	const enableTrampoline = options.trampoline ?? process.env.OMP_NO_UPDATE_TRAMPOLINE !== "1";
+	if (process.platform === "win32" && enableTrampoline) {
+		await spawnWindowsNpmTrampoline(args, release, options.trampolineOptions);
+		return undefined;
+	}
+
 	const result = await $`npm ${args}`.nothrow();
 	if (result.exitCode !== 0) {
 		throw new Error(`npm install failed with exit code ${result.exitCode}`);

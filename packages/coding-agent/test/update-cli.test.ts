@@ -13,6 +13,7 @@ import {
 	buildMiseUpgradeArgs,
 	buildNpmInstallArgs,
 	buildRenameCleanupPackages,
+	buildWindowsNpmTrampolineScript,
 	downloadVerifiedBinary,
 	type InstalledVersionVerification,
 	isMuslLinuxForTest,
@@ -36,6 +37,8 @@ import {
 	sweepStaleUpdateArtifacts,
 	updateViaBinaryAt,
 	updateViaManager,
+	spawnWindowsNpmTrampoline,
+	updateViaNpm,
 	updateViaShimTakeover,
 } from "@oh-my-pi/pi-coding-agent/cli/update-cli";
 import Update from "@oh-my-pi/pi-coding-agent/commands/update";
@@ -2042,5 +2045,137 @@ describe("update-cli manager update recovery", () => {
 		await expect(updateViaManager(release, launcherPath, steps)).rejects.toThrow(
 			"update did not produce a working launcher and binary repair failed: Error: no binary asset",
 		);
+	});
+});
+
+describe("update-cli Windows npm trampoline", () => {
+	const release: ReleaseInfo = {
+		tag: "v18.8.4",
+		version: "18.8.4",
+		packages: {
+			pkg: "@oh-my-pi/pi-coding-agent",
+			natives: "@oh-my-pi/pi-natives",
+		},
+		registry: "https://registry.npmjs.org/",
+	};
+
+	it("builds a detached batch script that waits on parent PID and self-deletes", () => {
+		const parentPid = 12345;
+		const args = ["install", "-g", "--registry=https://registry.npmjs.org/", "@oh-my-pi/pi-coding-agent@18.8.4"];
+		const logFile = "C:\\Temp\\omp-update-12345.log";
+
+		const script = buildWindowsNpmTrampolineScript(parentPid, args, logFile);
+
+		expect(script).toContain("Wait-Process -Id 12345 -Timeout 30");
+		expect(script).toContain(
+			'call npm install -g --registry=https://registry.npmjs.org/ @oh-my-pi/pi-coding-agent@18.8.4 > "C:\\Temp\\omp-update-12345.log" 2>&1',
+		);
+		expect(script).toContain("set EXIT_CODE=%ERRORLEVEL%");
+		expect(script).toContain('if %EXIT_CODE% equ 0 del /f /q "C:\\Temp\\omp-update-12345.log" 2>nul');
+		expect(script).toContain('start "" /b cmd /c "ping 127.0.0.1 -n 2 >nul & del /f /q "%~f0" >nul 2>&1"');
+		expect(script).toContain("exit /b %EXIT_CODE%");
+	});
+
+	it("escapes batch script arguments containing special characters", () => {
+		const parentPid = 54321;
+		const args = ["install", "-g", "package with spaces", '--flag="quoted"', "--url=https://pkg/%20"];
+		const logFile = "C:\\Temp\\update.log";
+
+		const script = buildWindowsNpmTrampolineScript(parentPid, args, logFile);
+
+		expect(script).toContain('"package with spaces"');
+		expect(script).toContain('"--url=https://pkg/%%%%20"');
+		expect(script).toContain("Wait-Process -Id 54321");
+	});
+
+	it("rejects newline characters in batch script arguments", () => {
+		const args = ["install", "bad\narg"];
+		expect(() => buildWindowsNpmTrampolineScript(123, args, "C:\\Temp\\test.log")).toThrow("Invalid newline");
+	});
+	it("rejects non-positive or non-integer parent PID", () => {
+		expect(() => buildWindowsNpmTrampolineScript(-1, ["install"], "C:\\Temp\\log.log")).toThrow("Invalid parentPid");
+		expect(() => buildWindowsNpmTrampolineScript(1.5, ["install"], "C:\\Temp\\log.log")).toThrow("Invalid parentPid");
+	});
+
+	it("rejects invalid characters in log file path", () => {
+		expect(() => buildWindowsNpmTrampolineScript(123, ["install"], "C:\\Temp\\log\n.log")).toThrow(
+			"Invalid logFilePath",
+		);
+		expect(() => buildWindowsNpmTrampolineScript(123, ["install"], 'C:\\Temp\\"log".log')).toThrow(
+			"Invalid logFilePath",
+		);
+	});
+
+	it("spawns the detached batch script with unref and calls exitImpl", async () => {
+		const dir = await makeTempDir();
+		const logFile = path.join(dir, "update.log");
+		let spawnedCommand: string | undefined;
+		let spawnedArgs: string[] | undefined;
+		let spawnedOptions: unknown;
+		let unrefCalled = false;
+		let exitCode: number | undefined;
+
+		const spawnImpl = (cmd: string, args: string[], options: unknown) => {
+			spawnedCommand = cmd;
+			spawnedArgs = args;
+			spawnedOptions = options;
+			return {
+				unref: () => {
+					unrefCalled = true;
+				},
+			};
+		};
+
+		const exitImpl = (code: number) => {
+			exitCode = code;
+		};
+
+		const scriptPath = await spawnWindowsNpmTrampoline(["install", "-g", "test-pkg"], release, {
+			parentPid: 99999,
+			tempDir: dir,
+			logFile,
+			spawnImpl,
+			exitImpl,
+		});
+
+		expect(spawnedCommand).toBe("cmd.exe");
+		expect(spawnedArgs).toEqual(["/c", scriptPath]);
+		expect(spawnedOptions).toEqual({
+			detached: true,
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		expect(unrefCalled).toBe(true);
+		expect(exitCode).toBe(0);
+
+		// Verify the file was written to disk
+		const writtenScript = await fs.readFile(scriptPath, "utf-8");
+		expect(writtenScript).toContain("Wait-Process -Id 99999");
+		expect(writtenScript).toContain("call npm install -g test-pkg");
+	});
+
+	it("delegates to trampoline in updateViaNpm on Windows and defers verification", async () => {
+		const dir = await makeTempDir();
+		let spawned = false;
+		let exited = false;
+
+		const verification = await updateViaNpm(release, {
+			trampoline: true,
+			trampolineOptions: {
+				parentPid: 88888,
+				tempDir: dir,
+				spawnImpl: () => {
+					spawned = true;
+					return { unref: () => {} };
+				},
+				exitImpl: () => {
+					exited = true;
+				},
+			},
+		});
+
+		expect(spawned).toBe(true);
+		expect(exited).toBe(true);
+		expect(verification).toBeUndefined();
 	});
 });
